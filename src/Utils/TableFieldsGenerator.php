@@ -3,8 +3,6 @@
 namespace InfyOm\Generator\Utils;
 
 use DB;
-use Doctrine\DBAL\Schema\AbstractSchemaManager;
-use Doctrine\DBAL\Schema\Column;
 use Illuminate\Support\Str;
 use InfyOm\Generator\Common\GeneratorField;
 use InfyOm\Generator\Common\GeneratorFieldRelation;
@@ -56,38 +54,31 @@ class TableFieldsGenerator
     /** @var array */
     public $ignoredFields;
 
-    /** @var \Doctrine\DBAL\Schema\Table */
-    public $tableDetails;
-
     public function __construct($tableName, $ignoredFields, $connection = '')
     {
         $this->tableName = $tableName;
         $this->ignoredFields = $ignoredFields;
 
-        if (!empty($connection)) {
-            $this->schemaManager = DB::connection($connection)->getDoctrineSchemaManager();
-        } else {
-            $this->schemaManager = DB::getDoctrineSchemaManager();
-        }
-
-        $platform = $this->schemaManager->getDatabasePlatform();
+        $platform = DB::getDriverName();
         $defaultMappings = [
             'enum' => 'string',
             'json' => 'text',
             'bit'  => 'boolean',
         ];
 
-//        $this->tableDetails = $this->schemaManager->listTableDetails($this->tableName);
-
         $mappings = config('laravel_generator.from_table.doctrine_mappings', []);
         $mappings = array_merge($mappings, $defaultMappings);
         foreach ($mappings as $dbType => $doctrineType) {
             $platform->registerDoctrineTypeMapping($dbType, $doctrineType);
         }
-        // Added
-        $this->tableDetails = $this->schemaManager->listTableDetails($this->tableName);
 
-        $columns = $this->schemaManager->listTableColumns($tableName);
+        $columns = DB::select("
+        SELECT COLUMN_NAME as name, DATA_TYPE as data_type,
+               CHARACTER_MAXIMUM_LENGTH as max_length, IS_NULLABLE as is_nullable,
+               COLUMN_DEFAULT as default_value, COLUMN_KEY as column_key
+        FROM information_schema.columns
+        WHERE table_name = :table AND table_schema = :schema
+    ", ['table' => $tableName, 'schema' => DB::getDatabaseName()]);
 
         $this->columns = [];
         foreach ($columns as $column) {
@@ -176,9 +167,19 @@ class TableFieldsGenerator
      */
     public function getPrimaryKeyOfTable($tableName)
     {
-        $column = $this->schemaManager->listTableDetails($tableName)->getPrimaryKey();
+        $databaseName = DB::getDatabaseName();
 
-        return $column ? $column->getColumns()[0] : '';
+        // Query to retrieve the primary key column name
+        $primaryKey = DB::selectOne("
+            SELECT COLUMN_NAME
+            FROM information_schema.key_column_usage
+            WHERE table_name = :table
+            AND table_schema = :schema
+            AND constraint_name = 'PRIMARY'
+        ", [
+            'table' => $tableName,
+            'schema' => $databaseName
+        ]);
     }
 
     /**
@@ -249,23 +250,62 @@ class TableFieldsGenerator
     }
 
     /**
-     * Generates field.
+     * Generates field metadata for the given column.
      *
-     * @param Column $column
-     * @param        $dbType
-     * @param        $htmlType
-     *
+     * @param object $column Column metadata from information_schema.
+     * @param string $dbType Database type for the column.
+     * @param string $htmlType HTML input type for the field.
      * @return GeneratorField
      */
     private function generateField($column, $dbType, $htmlType)
     {
         $field = new GeneratorField();
-        $field->name = $column->getName();
-        $field->fieldDetails = $this->tableDetails->getColumn($field->name);
-        $field->parseDBType($dbType); //, $column); TODO: handle column param
+        $field->name = $column->name;
+        $field->fieldDetails = $this->tableDetails[$field->name] ?? null;
+
+        // Parse database type and HTML input type for the field
+        $field->parseDBType($dbType);
         $field->parseHtmlInput($htmlType);
 
         return $this->checkForPrimary($field);
+    }
+
+    /**
+     * Fetches and structures table details for a given table name.
+     *
+     * @param string $tableName The name of the table.
+     * @return array Associative array of column metadata.
+     */
+    private function fetchTableDetails($tableName)
+    {
+        $databaseName = DB::getDatabaseName();
+
+        $columns = DB::select("
+            SELECT COLUMN_NAME as name,
+                DATA_TYPE as data_type,
+                CHARACTER_MAXIMUM_LENGTH as max_length,
+                IS_NULLABLE as is_nullable,
+                COLUMN_DEFAULT as default_value,
+                COLUMN_KEY as column_key
+            FROM information_schema.columns
+            WHERE table_name = :table AND table_schema = :schema
+        ", [
+            'table' => $tableName,
+            'schema' => $databaseName
+        ]);
+
+        $details = [];
+        foreach ($columns as $column) {
+            $details[$column->name] = [
+                'data_type' => $column->data_type,
+                'max_length' => $column->max_length,
+                'is_nullable' => $column->is_nullable === 'YES',
+                'default_value' => $column->default_value,
+                'is_primary' => $column->column_key === 'PRI',
+            ];
+        }
+
+        return $details;
     }
 
     /**
@@ -300,40 +340,69 @@ class TableFieldsGenerator
     }
 
     /**
-     * Prepares foreign keys from table with required details.
+     * Prepares foreign keys from all tables with required details.
      *
-     * @return GeneratorTable[]
+     * @return array Associative array of table names and their foreign keys.
      */
     public function prepareForeignKeys()
     {
-        $tables = $this->schemaManager->listTables();
+        $databaseName = DB::getDatabaseName();
+
+        // Step 1: Fetch all tables in the database
+        $tables = DB::select("
+            SELECT table_name 
+            FROM information_schema.tables 
+            WHERE table_schema = :schema
+        ", ['schema' => $databaseName]);
 
         $fields = [];
 
         foreach ($tables as $table) {
-            $primaryKey = $table->getPrimaryKey();
-            if ($primaryKey) {
-                $primaryKey = $primaryKey->getColumns()[0];
-            }
+            $tableName = $table->table_name;
+
+            // Fetch primary key for the current table
+            $primaryKey = $this->getPrimaryKeyOfTable($tableName);
+
+            // Fetch foreign keys for the current table
+            $foreignKeys = DB::select("
+                SELECT 
+                    kcu.CONSTRAINT_NAME AS name,
+                    kcu.COLUMN_NAME AS local_column,
+                    kcu.REFERENCED_TABLE_NAME AS foreign_table,
+                    kcu.REFERENCED_COLUMN_NAME AS foreign_column,
+                    rc.UPDATE_RULE AS on_update,
+                    rc.DELETE_RULE AS on_delete
+                FROM information_schema.key_column_usage AS kcu
+                JOIN information_schema.referential_constraints AS rc
+                ON kcu.CONSTRAINT_NAME = rc.CONSTRAINT_NAME
+                WHERE kcu.table_name = :table 
+                AND kcu.table_schema = :schema
+                AND kcu.REFERENCED_TABLE_NAME IS NOT NULL
+            ", [
+                'table' => $tableName,
+                'schema' => $databaseName
+            ]);
+
+            // Format each foreign key for the generator
             $formattedForeignKeys = [];
-            $tableForeignKeys = $table->getForeignKeys();
-            foreach ($tableForeignKeys as $tableForeignKey) {
+            foreach ($foreignKeys as $fk) {
                 $generatorForeignKey = new GeneratorForeignKey();
-                $generatorForeignKey->name = $tableForeignKey->getName();
-                $generatorForeignKey->localField = $tableForeignKey->getLocalColumns()[0];
-                $generatorForeignKey->foreignField = $tableForeignKey->getForeignColumns()[0];
-                $generatorForeignKey->foreignTable = $tableForeignKey->getForeignTableName();
-                $generatorForeignKey->onUpdate = $tableForeignKey->onUpdate();
-                $generatorForeignKey->onDelete = $tableForeignKey->onDelete();
+                $generatorForeignKey->name = $fk->name;
+                $generatorForeignKey->localField = $fk->local_column;
+                $generatorForeignKey->foreignField = $fk->foreign_column;
+                $generatorForeignKey->foreignTable = $fk->foreign_table;
+                $generatorForeignKey->onUpdate = $fk->on_update;
+                $generatorForeignKey->onDelete = $fk->on_delete;
 
                 $formattedForeignKeys[] = $generatorForeignKey;
             }
 
+            // Set up the GeneratorTable for this table
             $generatorTable = new GeneratorTable();
             $generatorTable->primaryKey = $primaryKey;
             $generatorTable->foreignKeys = $formattedForeignKeys;
 
-            $fields[$table->getName()] = $generatorTable;
+            $fields[$tableName] = $generatorTable;
         }
 
         return $fields;
